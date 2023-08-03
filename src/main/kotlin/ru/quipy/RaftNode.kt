@@ -12,6 +12,7 @@ import ru.quipy.RaftProperties.Companion.leaderHeartBeatFrequency
 import ru.quipy.raft.*
 import java.util.*
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.random.Random
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -39,10 +40,13 @@ class Node(
         Random.nextLong((RaftProperties.electionTimeoutBase.inWholeMilliseconds * RaftProperties.electionTimeoutRandomizationRatio).toLong())
 
     private val replicationAwaiter = SuspendableAwaiter<UUID, Unit, Unit>()
-    private val replicationChannel = Channel<Int>(capacity = 100_000)
+    private val replicationChannel = Channel<Pair<Int, UUID>>(capacity = 100_000)
 
     @Volatile
     private var lastKnownCommittedIndex = 0
+
+    @Volatile
+    private var lastHeartBeatFromMe: Long = 0
 
     fun shutdown() {
         electionJob.stop()
@@ -56,7 +60,7 @@ class Node(
         "raft",
         "election",
         executor,
-        delayer = Delayer.InvocationRatePreservingDelay(50.milliseconds) // todo sukhoa config
+        delayer = Delayer.InvocationRatePreservingDelay(10.milliseconds) // todo sukhoa config
     ) { _, _ ->
         val acceptableHBAbsencePeriod = RaftProperties.electionTimeoutBase.plus(randomNodePart.milliseconds)
         val currentTerm = termManager.getCurrentTerm()
@@ -85,7 +89,7 @@ class Node(
                     leaderProps = LeaderProperties(
                         serversExceptMe().map { it to FollowerInfo(indexToStartReplicationWith) }.toMap(mutableMapOf())
                     )
-                    replicationChannel.send(indexToStartReplicationWith)
+                    replicationChannel.send(indexToStartReplicationWith to UUID.randomUUID())
                     val updateSucceeded = termManager.whileTermNumberIsTryToUpdate(electionTerm.number) {
                         it.copy(raftStatus = LEADER)
                     }
@@ -159,8 +163,9 @@ class Node(
         }
     }
 
+    // todo sukhoa shoula be done inder lock for supporting concurrent clients
     private fun handleIncomingWriteRequest(requestId: UUID, rpc: LogWriteClientRequest) = scope.launch {
-        logger.info("[write]-[node-${me.address}]-[client-write]: Got by node $me from ${rpc.cameFrom}")
+        logger.info("[write]-[node-${me.address}]-[client-write]: Got by node $me from ${rpc.cameFrom}, reqId $requestId")
         val startedAt = System.currentTimeMillis()
         var currentTerm = termManager.getCurrentTerm()
         try {
@@ -171,7 +176,7 @@ class Node(
                 }
 
                 if (currentTerm.raftStatus != LEADER) {
-                    // todo sukhoa what if CANDIDATE
+                    // todo sukhoa what if CANDIDATE? leaderAddress is null
                     val forward = LogWriteClientRequest(
                         rpc.command,
                         cameFrom = me,
@@ -183,7 +188,7 @@ class Node(
                         to = currentTerm.leaderAddress!!,
                         forward
                     )
-                    logger.info("[write]-[node-${me.address}]-[client-write-redirect]: Redirect write to the leader ${currentTerm.leaderAddress!!} and wait")
+                    logger.info("[write]-[node-${me.address}]-[client-write-redirect]: Redirect write to the leader ${currentTerm.leaderAddress!!} and wait, reqId $requestId")
                     network.respond(
                         from = me,
                         requestId,
@@ -191,13 +196,13 @@ class Node(
                     )
                     return@withTimeout
                 }
-                replicationAwaiter.placeKey(rpc.command.id)
+                replicationAwaiter.placeKey(requestId)
                 val index = log.append(currentTerm.number, rpc.command)
-                logger.info("[write]-[node-${me.address}]-[appended]: Leader append write to its log $index, rpc $rpc")
+                logger.info("[write]-[node-${me.address}]-[appended]: Leader append write to its log $index, reqId $requestId, rpc $rpc")
 
-                replicationChannel.send(index)
-                val result = replicationAwaiter.putFirstValueAndWaitForSecond(rpc.command.id, Unit)
-                logger.info("[write]-[node-${me.address}]-[replicated]: Leader got replication response for index $index, result $result")
+                replicationChannel.send(index to requestId)
+                val result = replicationAwaiter.putFirstValueAndWaitForSecond(requestId, Unit)
+                logger.info("[write]-[node-${me.address}]-[replicated]: Leader got replication response for index $index, result $result, reqId $requestId")
 
                 network.respond(
                     me,
@@ -206,7 +211,7 @@ class Node(
                 )
             }
         } catch (e: TimeoutCancellationException) {
-            logger.info("[write]-[node-${me.address}]-[client-write-redirect]: Timeout awaiting response from ${currentTerm.leaderAddress}")
+            logger.info("[write]-[node-${me.address}]-[client-write-redirect]: Timeout awaiting response from ${currentTerm.leaderAddress}, reqId $requestId")
             network.respond(
                 from = me,
                 requestId,
@@ -216,7 +221,7 @@ class Node(
     }
 
     @Volatile
-    var currentlyReplicatingIndex = 0;
+    var currentlyReplicatingIndex = AtomicInteger(-1)
 
     private val replicationJob = PeriodicalJob(
         "raft",
@@ -230,21 +235,31 @@ class Node(
             return@PeriodicalJob
         }
 
-        currentlyReplicatingIndex = replicationChannel.receive()
-        logger.info("[replication]-[node-${me.address}]-[replication-job]: Leader starts replicating log entry index $currentlyReplicatingIndex")
+        val (indexToReplicate, reqId) = replicationChannel.receive()
+        while (true) {
+            val currIndexToReplicate = currentlyReplicatingIndex.get()
+            if (currIndexToReplicate >= indexToReplicate) {
+                logger.info("[replication]-[node-${me.address}]-[replication-job]: Reject replication as the index $indexToReplicate is smaller than those in replication $currIndexToReplicate, reqId $reqId")
+                return@PeriodicalJob
+            } else {
+                if (currentlyReplicatingIndex.compareAndSet(currIndexToReplicate, indexToReplicate)) break
+            }
+        }
+
+        logger.info("[replication]-[node-${me.address}]-[replication-job]: Leader starts replicating log entry index $indexToReplicate, reqId $reqId")
 
         val replicationJobs = leaderProps.followersInfo.map { (node, info) ->
             if (info.catchUpJob != null && !info.catchUpJob.isCompleted) node to info.catchUpJob
             else node to kickOffCatchUpJobAsync(
                 node,
-                currentlyReplicatingIndex,
+                indexToReplicate,
                 currentTerm
             ).also { leaderProps.setTheCatchUpJob(node, it) }
         }.toMap(mutableMapOf())
 
-        logger.info("[replication]-[node-${me.address}]-[replication-job]: Launched RPC calls for every cluster node to replicate log index $currentlyReplicatingIndex")
+        logger.info("[replication]-[node-${me.address}]-[replication-job]: Launched RPC calls for every cluster node to replicate log index $indexToReplicate, reqId $reqId")
 
-        var followersReplicated = 0
+        var followersReplicated = 1 // Me is a follower as well
         while (followersReplicated < clusterInformation.numberOfNodes) {
             val replicationStatus = select<FollowerReplicationStatus> {
                 replicationJobs.forEach { (_, job) ->
@@ -256,31 +271,32 @@ class Node(
 
             if (termManager.getCurrentTerm().raftStatus != LEADER) return@PeriodicalJob // todo sukhoa can be done in other way
 
-
             when (replicationStatus) {
                 is Succeeded -> {
-                    logger.info("[replication]-[node-${me.address}]-[replication-job]: Launched RPC calls for every cluster node to replicate log index $currentlyReplicatingIndex")
-                    if (replicationStatus.lastReplicatedIndex == currentlyReplicatingIndex) {
+                    logger.info("[replication]-[node-${me.address}]-[replication-job]: Node ${replicationStatus.follower} successfully replication index $indexToReplicate, reqId $reqId")
+                    if (replicationStatus.lastReplicatedIndex == indexToReplicate) {
                         followersReplicated++
                         if (followersReplicated >= clusterInformation.majority) {
-                            lastKnownCommittedIndex = currentlyReplicatingIndex
-                            val replicatedEntry = log.logEntryOfIndex(currentlyReplicatingIndex)
-                            logger.info("[replication]-[node-${me.address}]-[replication-job]: Log index $currentlyReplicatingIndex was confirmed by the majority, replicated entry: $replicatedEntry")
-                            replicationAwaiter.putSecondValueAndWaitForFirst(
-                                replicatedEntry.command.id,
-                                Unit
-                            ) // todo sukhoa should be async
+                            lastKnownCommittedIndex = indexToReplicate
+                            val replicatedEntry = log.logEntryOfIndex(indexToReplicate)
+                            logger.info("[replication]-[node-${me.address}]-[replication-job]: Log index $indexToReplicate was confirmed by the majority, reqId $reqId, replicated entry: $replicatedEntry")
+                            scope.launch {
+                                replicationAwaiter.putSecondValueAndWaitForFirst(
+                                    reqId,
+                                    Unit
+                                )
+                            }
                             return@PeriodicalJob
                         }
                     } else {
                         logger.info(
                             "[replication]-[node-${me.address}]-[replication-job]: Index ${replicationStatus.lastReplicatedIndex} " +
-                                    "replicated to follower ${replicationStatus.follower}, but needed $currentlyReplicatingIndex, kicked off catch up job"
+                                    ", reqId $reqId replicated to follower ${replicationStatus.follower}, but needed $indexToReplicate, kicked off catch up job"
                         )
 
                         kickOffCatchUpJobAsync(
                             replicationStatus.follower,
-                            currentlyReplicatingIndex,
+                            indexToReplicate,
                             currentTerm
                         ).also {
                             leaderProps.setTheCatchUpJob(replicationStatus.follower, it)
@@ -289,7 +305,7 @@ class Node(
                     }
                 }
                 is FollowerReplicationStatus.Failed -> {
-                    logger.info("[replication]-[node-${me.address}]-[replication-job]: Problem detected. Follower ${replicationStatus.follower} has term ${replicationStatus.termNumber}, my term is $currentTerm")
+                    logger.info("[replication]-[node-${me.address}]-[replication-job]: Problem detected , reqId $reqId. Follower ${replicationStatus.follower} has term ${replicationStatus.termNumber}, my term is $currentTerm")
                     continue
                 }
             }
@@ -310,7 +326,7 @@ class Node(
                 return@async FollowerReplicationStatus.Failed(follower, replicationResult.followerTerm)
             }
             if (replicationResult.success) {
-                if (indexToReplicate == currentlyReplicatingIndex) {
+                if (indexToReplicate == currentlyReplicatingIndex.get()) {
                     return@async Succeeded(follower, indexToReplicate)
                 } else {
                     val nextIndex = leaderProps.increaseFollowerReplicationIndex(follower)
@@ -326,7 +342,6 @@ class Node(
     }
 
     sealed class FollowerReplicationStatus(val follower: NodeAddress) {
-
         class Succeeded(follower: NodeAddress, val lastReplicatedIndex: Int) : FollowerReplicationStatus(follower)
         class Failed(follower: NodeAddress, val termNumber: Int) : FollowerReplicationStatus(follower)
     }
@@ -429,8 +444,6 @@ class Node(
         }
     }
 
-    @Volatile
-    var lastHeartBeatFromMe: Long = 0 // todo sukhoa Leader property
     private val heartBeatJob = PeriodicalJob(
         "raft",
         "network",
@@ -451,8 +464,7 @@ class Node(
         }
     }
 
-    suspend fun initiateElection(electionTerm: TermInfo): ElectionResult {
-
+    private suspend fun initiateElection(electionTerm: TermInfo): ElectionResult {
         // To begin an election, a follower increments its current term and transitions to candidate state.
         // It then votes for itself and issues RequestVote RPCs in parallel to each of the other servers in the cluster.
         // A candidate continues in this state until one of three things happens:
@@ -536,7 +548,7 @@ class Node(
         return Failed(votedForMe, responded)
     }
 
-    suspend fun handleIncomingVoteRequest(reqId: UUID, req: RequestVoteRPCRequest) = scope.launch {
+    private suspend fun handleIncomingVoteRequest(reqId: UUID, req: RequestVoteRPCRequest) = scope.launch {
         logger.info("[election]-[node-${me.address}]-[rpc-request-vote-req]: Got vote request $reqId $req")
 
         var currentTerm = termManager.getCurrentTerm()
@@ -555,6 +567,7 @@ class Node(
 
         val myLastLogEntry = log.last()
         val candidatesLogEntry = req.toLogEntry()
+
 
         if (termManager.whileConditionTrueIsTryToUpdate({ currentTerm.number == it.number && it.votedFor == null && myLastLogEntry <= candidatesLogEntry }) {
                 it.copy(votedFor = req.candidateId)
@@ -585,12 +598,6 @@ class Node(
 
 
     private fun serversExceptMe() = clusterInformation.nodes.filter { it != me }
-}
-
-enum class NodeRaftStatus {
-    FOLLOWER,
-    LEADER,
-    CANDIDATE
 }
 
 data class FollowerInfo(

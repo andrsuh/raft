@@ -49,6 +49,12 @@ class TermManager {
     }
 }
 
+enum class NodeRaftStatus {
+    FOLLOWER,
+    LEADER,
+    CANDIDATE
+}
+
 data class TermInfo(
     val leaderAddress: NodeAddress? = null,
     val raftStatus: NodeRaftStatus = FOLLOWER, // When servers start up, they begin as followers
