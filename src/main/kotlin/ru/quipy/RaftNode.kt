@@ -90,7 +90,7 @@ class Node(
                         serversExceptMe().map { it to FollowerInfo(indexToStartReplicationWith) }.toMap(mutableMapOf())
                     )
                     replicationChannel.send(indexToStartReplicationWith to UUID.randomUUID())
-                    val updateSucceeded = termManager.whileTermNumberIsTryToUpdate(electionTerm.number) {
+                    val updateSucceeded = termManager.tryUpdateWhileTermIs(electionTerm.number) {
                         it.copy(raftStatus = LEADER)
                     }
                     if (updateSucceeded) {
@@ -100,7 +100,7 @@ class Node(
                     }
                 }
                 is Failed -> {
-                    val updateSucceeded = termManager.whileTermNumberIsTryToUpdate(electionTerm.number) {
+                    val updateSucceeded = termManager.tryUpdateWhileTermIs(electionTerm.number) {
                         it.copy(raftStatus = FOLLOWER)
                     }
                     if (updateSucceeded) {
@@ -115,24 +115,24 @@ class Node(
                      * If a candidate or leader discovers that its term is out of date, it immediately reverts to follower state.
                      */
                     logger.info("[election]-[node-${me.address}]-[election-job]: Failed election, higher term detected ${electionResult.termNumber} on node ${electionResult.nodeWithHigherTerm}. My term was ${electionResult.myTerm}")
-                    termManager.whileConditionTrueIsTryToUpdate({ it.number < electionResult.termNumber }) {
+                    termManager.tryUpdateWhileConditionTrue({ it.number < electionResult.termNumber }) {
                         TermInfo(number = electionResult.termNumber)
                     }
                 }
                 is Timeout -> {
                     logger.info("[election]-[node-${me.address}]-[election-job]: Election timeout $me term ${electionTerm.number}")
-                    termManager.whileTermNumberIsTryToUpdate(electionTerm.number) {
+                    termManager.tryUpdateWhileTermIs(electionTerm.number) {
                         it.copy(raftStatus = FOLLOWER)
                     }
                 }
                 is RecognizedAnotherLeader -> {
                     logger.info("[election]-[node-${me.address}]-[election-job]: Recognised another leader for term ${electionResult.electionTerm}, leader ${electionResult.termInfo}")
-                    termManager.whileTermNumberIsTryToUpdate(electionTerm.number) {
+                    termManager.tryUpdateWhileTermIs(electionTerm.number) {
                         it.copy(raftStatus = FOLLOWER)
                     }
                 }
             }
-            termManager.whileTermNumberIsTryToUpdate(electionTerm.number) {
+            termManager.tryUpdateWhileTermIs(electionTerm.number) {
                 it.copy(lastHeartbeatFromLeader = System.currentTimeMillis())
             }
         }
@@ -382,14 +382,14 @@ class Node(
         log.commitIfRequired(rpc.leaderHighestCommittedIndex)
 
         // if leader term >= current and the election is in progress then we have to stop the election and recognise the new leader
-        if (termManager.whileConditionTrueIsTryToUpdate({ it.number == currentTerm.number && it.leaderAddress == null }) {
+        if (termManager.tryUpdateWhileConditionTrue({ it.number == currentTerm.number && it.leaderAddress == null }) {
                 TermInfo(leaderAddress = rpc.leaderAddress, number = rpc.leaderTerm, raftStatus = FOLLOWER)
             }) {
             logger.info("[heartbeat]-[node-${me.address}]-[heartbeat-handle]: Term changed ${rpc}, previous ${termManager}. Leader Assigned")
             return@launch
         }
 
-        if (termManager.whileConditionTrueIsTryToUpdate({ rpc.leaderTerm > it.number }) {
+        if (termManager.tryUpdateWhileConditionTrue({ rpc.leaderTerm > it.number }) {
                 TermInfo(leaderAddress = rpc.leaderAddress, number = rpc.leaderTerm, raftStatus = FOLLOWER)
             }) {
             logger.info("[heartbeat]-[node-${me.address}]-[heartbeat-handle]: Term changed ${rpc}, previous ${termManager}. My term is lower")
@@ -397,7 +397,7 @@ class Node(
         }
         logger.info("[heartbeat]-[node-${me.address}]-[heartbeat-handle]: Heartbeat from ${rpc.leaderAddress} term ${rpc.leaderTerm}")
 
-        termManager.whileTermNumberIsTryToUpdate(currentTerm.number) {
+        termManager.tryUpdateWhileTermIs(currentTerm.number) {
             it.copy(lastHeartbeatFromLeader = System.currentTimeMillis())
         }
     }
@@ -409,13 +409,13 @@ class Node(
             network.respond(me, reqId, AppendEntriesRPCResponse(currentTerm.number, success = false))
         }
 
-        if (termManager.whileConditionTrueIsTryToUpdate({ it.number == currentTerm.number && it.leaderAddress == null }) {
+        if (termManager.tryUpdateWhileConditionTrue({ it.number == currentTerm.number && it.leaderAddress == null }) {
                 TermInfo(leaderAddress = rpc.leaderAddress, number = rpc.leaderTerm, raftStatus = FOLLOWER)
             }) {
             logger.info("[heartbeat]-[node-${me.address}]-[append]: Term changed ${rpc}, previous ${termManager}. Leader Assigned")
         }
 
-        if (termManager.whileConditionTrueIsTryToUpdate({ rpc.leaderTerm > it.number }) {
+        if (termManager.tryUpdateWhileConditionTrue({ rpc.leaderTerm > it.number }) {
                 TermInfo(leaderAddress = rpc.leaderAddress, number = rpc.leaderTerm, raftStatus = FOLLOWER)
             }) {
             logger.info("[heartbeat]-[node-${me.address}]-[append]: Term changed ${rpc}, previous ${termManager}. My term is lower")
@@ -439,7 +439,7 @@ class Node(
             network.respond(me, reqId, AppendEntriesRPCResponse(currentTerm.number, success = false))
         }
 
-        termManager.whileTermNumberIsTryToUpdate(currentTerm.number) {
+        termManager.tryUpdateWhileTermIs(currentTerm.number) {
             it.copy(lastHeartbeatFromLeader = System.currentTimeMillis())
         }
     }
@@ -529,7 +529,7 @@ class Node(
                 voteResp.voteGranted -> {
                     votedForMe.add(voteResp.voter)
                     if (votedForMe.size >= clusterInformation.majority) {
-                        termManager.whileTermNumberIsTryToUpdate(electionTerm.number) {
+                        termManager.tryUpdateWhileTermIs(electionTerm.number) {
                             TermInfo(
                                 me,
                                 lastHeartbeatFromLeader = System.currentTimeMillis(),
@@ -558,7 +558,7 @@ class Node(
             network.respond(me, reqId, resp)
         }
 
-        if (termManager.whileConditionTrueIsTryToUpdate({ req.candidatesTerm > it.number }) {
+        if (termManager.tryUpdateWhileConditionTrue({ req.candidatesTerm > it.number }) {
                 TermInfo(number = req.candidatesTerm)
             }) {
             logger.info("[election]-[node-${me.address}]-[rpc-request-vote-req]: Expired term ${currentTerm.number}, update to ${req.candidatesTerm}")
@@ -569,7 +569,7 @@ class Node(
         val candidatesLogEntry = req.toLogEntry()
 
 
-        if (termManager.whileConditionTrueIsTryToUpdate({ currentTerm.number == it.number && it.votedFor == null && myLastLogEntry <= candidatesLogEntry }) {
+        if (termManager.tryUpdateWhileConditionTrue({ currentTerm.number == it.number && it.votedFor == null && myLastLogEntry <= candidatesLogEntry }) {
                 it.copy(votedFor = req.candidateId)
             }) {
             val resp = RequestVoteRPCResponse(me, currentTerm.number, true)

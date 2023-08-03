@@ -11,7 +11,7 @@ class TermManager {
 
     fun getCurrentTerm() = currentTerm.get()
 
-    fun whileTermNumberIsTryToUpdate(termNumber: Int, transform: (current: TermInfo) -> TermInfo): Boolean {
+    fun tryUpdateWhileTermIs(termNumber: Int, transform: (current: TermInfo) -> TermInfo): Boolean {
         while (true) {
             val current = currentTerm.get()
             if (current.number != termNumber) return false
@@ -20,7 +20,7 @@ class TermManager {
         }
     }
 
-    fun whileConditionTrueIsTryToUpdate(
+    fun tryUpdateWhileConditionTrue(
         condition: (current: TermInfo) -> Boolean,
         transform: (current: TermInfo) -> TermInfo
     ): Boolean {
