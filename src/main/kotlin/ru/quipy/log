@@ -1,0 +1,26 @@
+
+
+1. Statuses of the nodes
+    - create Node and raft status structures
+2. "Each server stores a current term number"
+    - add term number to node
+3. RPSs - RequestVoteRPC, AppendEntriesRPC
+4. electionTimeoutBase added
+    - added lastHeartbeat attribute of the Node
+5. initiateElection() method
+6. Log
+    - Commands
+    - Log
+    - Log records
+    - Change AppendEntriesRPC
+7. Leader property - highest committed index
+    - add this index to  AppendEntriesRPC
+8. Consistency check
+    - add prev entry term and index to AppendEntriesRPC
+9. Maintain information about the indexes to be sent to followers on leader
+    - introduce NodeAddress class
+    - add such a property to LeaderProperties
+10. RequestVote RPC : information about the candidate’s log
+11. Implement Network stuff
+12. Cluster information
+
