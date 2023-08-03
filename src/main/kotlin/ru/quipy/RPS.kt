@@ -1,6 +1,6 @@
-package ru.quipy.raft
+package ru.quipy
 
-import ru.quipy.LogEntry
+import ru.quipy.raft.NodeAddress
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 

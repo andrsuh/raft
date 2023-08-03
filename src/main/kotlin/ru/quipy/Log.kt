@@ -1,9 +1,6 @@
 package ru.quipy
 
 import ru.quipy.LogEntry.Companion.emptyLogEntity
-import ru.quipy.raft.AppendEntriesRPCRequest
-import ru.quipy.raft.Command
-import ru.quipy.raft.InternalCommand
 import java.util.concurrent.atomic.AtomicInteger
 
 /**

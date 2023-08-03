@@ -2,6 +2,8 @@ package ru.quipy
 
 import kotlinx.coroutines.*
 import org.slf4j.LoggerFactory
+import ru.quipy.Delayer.*
+import ru.quipy.PeriodicalJob.MaintenanceJobState.STOPPED
 import java.util.concurrent.ExecutorService
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
@@ -14,7 +16,7 @@ class PeriodicalJob(
     val name: String,
     private val executor: ExecutorService,
     maintenanceDispatcher: CoroutineDispatcher =
-            executor.asCoroutineDispatcher(),
+        executor.asCoroutineDispatcher(),
     maintenanceExceptionHandler: CoroutineExceptionHandler = createDefaultExceptionHandler("$jobNamespace:$name"),
     private val relaunchOnUnexpectedCompletion: Boolean = true,
     private val delayBeforeFirstExecutionMillis: Long = 0,
@@ -34,11 +36,8 @@ class PeriodicalJob(
     private val maintenanceScope =
         CoroutineScope(coroutineContext.plus(SupervisorJob() + maintenanceDispatcher + maintenanceExceptionHandler))
 
-    private val fullJobName = "$jobNamespace:$name"
-
     private val maintenanceCompletionHandler: CompletionHandler = { th: Throwable? ->
         if (jobState != STOPPED && relaunchOnUnexpectedCompletion) {
-//            eventTracer.fatal(F_MAINTENANCE_FAILED, fullJobName.reveal(), th)
             maintenanceJob = launchMaintenanceJob()
         }
         maintenanceJob.isActive
@@ -53,9 +52,6 @@ class PeriodicalJob(
 
     private fun launchMaintenanceJob() =
         maintenanceScope.launch {
-//            metrics.maintenanceJobLaunched(jobNamespace, name)
-//            eventTracer.info(I_MAINTENANCE_STARTED, fullJobName.reveal(), delayer.delayDuration.toMillis())
-
             delay(delayBeforeFirstExecutionMillis)
             var invocationNum = 0
             while (jobState != STOPPED) {
@@ -64,12 +60,10 @@ class PeriodicalJob(
                         withTimeout(timeout.inWholeMilliseconds) {
                             maintenanceFunction(invocationNum, this@PeriodicalJob)
                         }
-                    } catch (e: TimeoutCancellationException) {
-//                        eventTracer.error(E_MAINTENANCE_TIMEOUT, fullJobName.reveal(), timeout.toMillis(), e.cause)
+                    } catch (ignored: TimeoutCancellationException) {
                     }
                 }
                 invocationNum++
-//                metrics.maintenancePerformed(jobNamespace, name, maintenanceDuration)
 
                 when (delayer) {
                     is FixedDelay -> delayer.delay()
@@ -77,7 +71,6 @@ class PeriodicalJob(
                     is InvocationRatePreservingDelay -> delayer.delay(maintenanceDuration)
                 }
             }
-//            eventTracer.info(I_MAINTENANCE_STOPPED, fullJobName)
         }.also {
             it.invokeOnCompletion(maintenanceCompletionHandler)
         }

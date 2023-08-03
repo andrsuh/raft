@@ -1,13 +1,11 @@
-package ru.quipy.raft
+package ru.quipy
 
 import io.prometheus.client.Counter
 import io.prometheus.client.exporter.HTTPServer
 import kotlinx.coroutines.*
 import org.slf4j.LoggerFactory
-import ru.quipy.ClusterInformation
-import ru.quipy.Delayer
-import ru.quipy.PeriodicalJob
-import ru.quipy.raft.NodeRaftStatus.LEADER
+import ru.quipy.NodeRaftStatus.LEADER
+import ru.quipy.raft.*
 import java.util.concurrent.Executors
 import kotlin.random.Random
 import kotlin.time.Duration
@@ -145,8 +143,6 @@ fun test(setUp: TestSetup): TestReport {
                 logger.error("Deadlock detected during write operation. Setup $setUp")
                 testItems.add(TestReportItem(Unit, message = "Deadlock detected during write operation. Setup $setUp"))
             }
-
-//            delay(Random.nextLong(1_000))
 
             networkChangeByOperationNumber[i]?.change(nodes, networkLinks)?.also {
                 testItems.add(it)
