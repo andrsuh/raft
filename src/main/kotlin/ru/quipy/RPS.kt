@@ -26,10 +26,10 @@ data class RequestVoteRPCRequest(
 // and the basic consensus algorithm requires only two types of RPCs
 
 data class RequestVoteRPCResponse(
-    val voter: NodeAddress,
+    override val node: NodeAddress, // voter
     val currentTerm: Int,
     val voteGranted: Boolean
-)
+): NodeResponse
 
 // Initiated by leaders to replicate log entries and to provide a form of heartbeat
 // AppendEntries RPCs that carry no log entries serves as HB
@@ -84,7 +84,6 @@ enum class LogWriteStatus {
     SUCCESS, FAIL
 }
 
-//data class LogWriteForwardedClientResponse(
-//    val status: LogWriteStatus,
-//    val servedBy: NodeAddress
-//)
+interface NodeResponse {
+    val node: NodeAddress
+}
