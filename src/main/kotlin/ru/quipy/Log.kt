@@ -1,6 +1,11 @@
 package ru.quipy
 
-import ru.quipy.LogEntry.Companion.emptyLogEntity
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import org.slf4j.LoggerFactory
+import ru.quipy.raft.NodeAddress
+import java.util.*
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -10,8 +15,12 @@ import java.util.concurrent.atomic.AtomicInteger
  * logs agree, delete any entries in the follower’s log after that point, and send the follower all of the leader’s
  * entries after that point.
  */
-class Log {
-    val log = mutableListOf<LogEntry>() // todo sukhoa private
+class Log(private val node: NodeAddress) {
+    companion object {
+        private val logger = LoggerFactory.getLogger("log")
+    }
+
+    val log = CopyOnWriteArrayList<LogEntry>() // todo sukhoa private
 
     /**
      *  Leader keeps track of the highest index it knows to be committed, and it includes that index in future [AppendEntriesRPCRequest] RPCs (including heartbeats)
@@ -22,32 +31,46 @@ class Log {
     @Volatile
     private var lastIndex = -1
 
-    @Synchronized
-    fun append(term: Int, command: Command): Int {
-        lastIndex++
-        log.add(LogEntry(command, term, lastIndex, false))
-        return lastIndex
-    }
+    private val logMutex = Mutex()
 
-    fun last() = log.lastOrNull() ?: emptyLogEntity // todo sukhoa sync and others too
-
-//    fun lastCommittedIndex(): Int = lastCommittedIndex
-
-    fun commitIfRequired(indexToCommit: Int) {
-        while (true) {
-            val myLastCommitted = lastCommittedIndex.get()
-            if (myLastCommitted < indexToCommit) {
-                if (lastCommittedIndex.compareAndSet(myLastCommitted, indexToCommit)) break
-            } else break
+    suspend fun append(term: Int, command: Command, requestId: UUID): Int {
+        logMutex.withLock {
+            lastIndex++
+            log.add(LogEntry(command, term, lastIndex, false, requestId))
+            return lastIndex
         }
     }
 
-    fun logEntryOfIndex(index: Int): LogEntry {
-        if (index < 0 || index > lastIndex) return emptyLogEntity
+    fun last() = log.lastOrNull() // todo sukhoa sync and others too
+
+//    fun lastCommittedIndex(): Int = lastCommittedIndex
+
+    suspend fun commitIfRequired(indexToCommit: Int) {
+        logMutex.withLock {
+            while (true) {
+                if (lastIndex < indexToCommit || log.isEmpty()) {
+                    logger.info("[log]-[node-${node.address}]-[commit-if-required]: Didn't committed $indexToCommit Log size ${log.size}, last index $lastIndex")
+                    break
+                }
+                val myLastCommitted = lastCommittedIndex.get()
+                if (myLastCommitted < indexToCommit) {
+                    if (lastCommittedIndex.compareAndSet(myLastCommitted, indexToCommit))  {
+                        logger.info("[log]-[node-${node.address}]-[commit-if-required]: Committed index $indexToCommit")
+                        break
+                    }
+                } else {
+                    logger.info("[log]-[node-${node.address}]-[commit-if-required]: Didn't committed $indexToCommit, as mine committed $myLastCommitted")
+                    break
+                }
+            }
+        }
+    }
+
+    fun logEntryOfIndex(index: Int): LogEntry? {
+        if (index < 0 || index > lastIndex) return null
         return log[index]
     }
 
-    @Synchronized
     fun acceptValueAndDeleteSubsequent(replicating: LogEntry) {
         log.removeIf {
             it.logIndex >= replicating.logIndex
@@ -61,17 +84,28 @@ class Log {
 
     fun isEmpty() = log.isEmpty()
 
-    fun eligibleForReplication(index: Int) = index > lastCommittedIndex.get() || index > lastIndex || log.isEmpty()
+    suspend fun eligibleForReplication(index: Int): Boolean {
+        logMutex.withLock {
+            val eligible = index > lastCommittedIndex.get() || index > lastIndex || log.isEmpty()
+            if (!eligible) {
+                logger.info("[log]-[node-${node.address}]-[check-if-eligible]: Rejecting. Index $index should not be accepted. " +
+                        "My log size ${log.size}, last index $lastIndex, lastCommittedIndex $lastCommittedIndex")
+            }
+            return eligible
+        }
+    }
 }
 
 data class LogEntry(
     val command: Command, // stores a state machine command
     val termNumber: Int, // term number when the entry was received by the leader
     val logIndex: Int, // index identifying its position in the log
-    val committed: Boolean // The leader decides when it is safe to apply a log entry to the state machines; such an entry is called committed.
+    val committed: Boolean, // The leader decides when it is safe to apply a log entry to the state machines; such an entry is called committed.
+    val requestId: UUID // metadata that designates the requestID under which the logEntry was created
 ) {
     companion object {
-        val emptyLogEntity = LogEntry(InternalCommand(), 0, -1, false)
+        val dummyRequestUUID = UUID.fromString("436eebfa-5a05-445e-9d4d-70fcd7d7eb1a")
+        val emptyLogEntity = LogEntry(InternalCommand(), 0, -1, false, dummyRequestUUID)
     }
 
     operator fun compareTo(other: LogEntry): Int {
