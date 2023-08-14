@@ -6,8 +6,9 @@ import kotlinx.coroutines.*
 import org.slf4j.LoggerFactory
 import ru.quipy.NodeRaftStatus.LEADER
 import ru.quipy.raft.*
+import java.util.*
 import java.util.concurrent.Executors
-import kotlin.random.Random
+import kotlin.random.Random.Default.nextInt
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -49,9 +50,10 @@ data class TestReport(
     val items: List<TestReportItem<*>>,
     val resultedLog: String = "",
     val statesSnapshot: List<String> = listOf(),
+    val expectedStateMachine: Map<String, Int>,
 ) {
     override fun toString(): String {
-        return "TestReport(\nsuccess=$succcess,\nresultedLog=${resultedLog.map { "$it" }}),\nitems=${items.map { "\n$it" }}),\nstatesSnapshot=${statesSnapshot.map { "\n$it" }})"
+        return "TestReport(\nsuccess=$succcess,\nresultedLog=${resultedLog.map { "$it" }}),\nitems=${items.map { "\n$it" }}),\nstatesSnapshot=${statesSnapshot.map { "\n$it" }}),\n expected state machine $expectedStateMachine"
     }
 }
 
@@ -89,27 +91,19 @@ fun test(setUp: TestSetup): TestReport {
         Node(it, clusterInformation, network, executor)
     }.toList()
 
+    val stateMachine = mutableMapOf<String, Int>()
+
     var prevHash = 0;
     val logViewJob = PeriodicalJob(
         "client",
         "log-view",
         executor,
-        delayer = Delayer.InvocationRatePreservingDelay(1.milliseconds)
+        delayer = Delayer.InvocationRatePreservingDelay(500.milliseconds)
     ) { _, _ ->
-        val sb = StringBuilder(500)
-        nodes.forEach {
-            val currentTerm = it.termManager.getCurrentTerm()
-            sb.append(
-                "[Node ${it.me}], status: ${if (currentTerm.raftStatus == LEADER) "${currentTerm.raftStatus}  " else currentTerm.raftStatus}, term: ${currentTerm.number}, log: ${
-                    it.log.log.map { "| ${it.termNumber}" }.joinToString { it }
-                }"
-            )
-            sb.append("\n")
-        }
-        val resultString = sb.toString()
+        val resultString = nodes.snapshot().toString()
         val newHash = resultString.hashCode()
         if (newHash != prevHash) {
-            println(resultString)
+//            println(resultString)
             snapshots.add(resultString)
             prevHash = newHash
         }
@@ -118,7 +112,7 @@ fun test(setUp: TestSetup): TestReport {
     val numberOfNetChanges = setUp.networkChangingHooks.size
     if (numberOfNetChanges > setUp.numberOfWrites) error("numberOfNetChanges > setUp.numberOfWrites, setup $setUp")
 
-    val networkChangeByOperationNumber = (1..numberOfNetChanges).map { Random.nextInt(setUp.numberOfWrites) }
+    val networkChangeByOperationNumber = (1..numberOfNetChanges).map { nextInt(setUp.numberOfWrites) }
         .zip(setUp.networkChangingHooks)
         .toMap() // todo sukhoa here the net change may be overwritten as the Randon can return same numbers
 
@@ -127,14 +121,20 @@ fun test(setUp: TestSetup): TestReport {
         for (i in (1..setUp.numberOfWrites)) {
             try {
                 withTimeout(setUp.timeoutForDeadlockDetection.inWholeMilliseconds) {
+                    val key = nextInt(0, 3).toString()
+                    val value = nextInt(0, 100)
+
+                    val dbCommand = ClientCommand(key = key, value = value)
                     val response = network.requestAndWait<LogWriteClientRequest, LogWriteClientResponse>(
                         clientNode,
                         clusterNodesAddresses.random(),
-                        LogWriteClientRequest(InternalCommand(), cameFrom = clientNode, timeout = setUp.writesTimeout)
+                        LogWriteClientRequest(dbCommand, cameFrom = clientNode, timeout = setUp.writesTimeout)
                     )
+
                     logger.info("Got response for write operation $response")
-                    testItems.add(TestReportItem(response))
+                    testItems.add(TestReportItem(response, ", $dbCommand"))
                     if (response.status == LogWriteStatus.SUCCESS) {
+                        stateMachine[key] = value
                         requests.inc()
                         successfulResponses++
                     }
@@ -161,25 +161,44 @@ fun test(setUp: TestSetup): TestReport {
                 succcess = false,
                 items = testItems,
                 resultedLog = resultedLogs.toString(),
-                statesSnapshot = snapshots
+                statesSnapshot = snapshots,
+                expectedStateMachine = stateMachine
             )
         }
 
         return@runBlocking if (resultedLogs.isEmpty()) {
             logger.error("Didn't get any log $resultedLogs")
-            TestReport(succcess = false, items = testItems, statesSnapshot = snapshots)
+            TestReport(
+                succcess = false,
+                items = testItems,
+                statesSnapshot = snapshots,
+                expectedStateMachine = stateMachine
+            )
         } else {
+            delay(5_000)
             return@runBlocking resultedLogs.firstNotNullOf {
                 if (it.key.length == successfulResponses) {
                     logger.info("Test successfully passed ${it.key}")
-                    TestReport(items = testItems, resultedLog = it.key, statesSnapshot = snapshots)
+                    TestReport(
+                        items = testItems,
+                        resultedLog = it.key,
+                        statesSnapshot = snapshots,
+                        expectedStateMachine = stateMachine
+                    )
                 } else {
                     logger.error("TEST FAIL: LOG ${it.key}, length ${it.key.length}, expected $successfulResponses")
-                    TestReport(succcess = false, items = testItems, resultedLog = it.key, statesSnapshot = snapshots)
+                    TestReport(
+                        succcess = false,
+                        items = testItems,
+                        resultedLog = it.key,
+                        statesSnapshot = snapshots,
+                        expectedStateMachine = stateMachine
+                    )
                 }
             }
         }
     }.also {
+//        snapshots.add(nodes.snapshot().toString())
         nodes.forEach { it.shutdown() }
         logViewJob.stop()
     }
@@ -263,4 +282,24 @@ val randomNodePartitionOrOpposite = NetworkChangerHook { nodes: List<Node>, link
         NetworkChangeResult(linksChanged),
         message = "Node ${nodeToPartition.me} was ${if (activate) "got back to cluster" else "partitioned"}"
     )
+}
+
+data class ClientCommand(
+    override val id: UUID = UUID.randomUUID(),
+    override val key: String,
+    override val value: Int
+) : Command
+
+fun List<Node>.snapshot(): StringBuilder {
+    val sb = StringBuilder(500)
+    forEach {
+        val currentTerm = it.termManager.getCurrentTerm()
+        sb.append(
+            "[Node ${it.me}], status: ${if (currentTerm.raftStatus == LEADER) "${currentTerm.raftStatus}  " else currentTerm.raftStatus}, term: ${currentTerm.number}, log: ${
+                it.log.log.map { "| ${it.termNumber}" }.joinToString { it }
+            } State machine ${it.stateMachine.map}"
+        )
+        sb.append("\n")
+    }
+    return sb
 }
