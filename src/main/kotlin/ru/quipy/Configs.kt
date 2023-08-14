@@ -4,7 +4,7 @@ import ru.quipy.raft.NodeAddress
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
-val networkUpperTimeout = 70.milliseconds
+val networkUpperTimeout = 20.milliseconds
 
 class RaftProperties {
     companion object {
@@ -20,7 +20,7 @@ class RaftProperties {
          * then it assumes there is no viable leader and begins an election to choose a new leader
          *
          */
-        val electionTimeoutBase = 3.seconds
+        val electionTimeoutBase = 2.seconds
 
         val electionTimeoutRandomizationRatio = 0.25
 
