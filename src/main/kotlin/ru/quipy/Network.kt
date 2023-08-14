@@ -18,7 +18,7 @@ data class NetworkTopology(
     val clientNodes: List<NodeAddress>
 ) {
     fun checkAvailability(from: NodeAddress, to: NodeAddress) =
-        from in clientNodes || ((from linkedTo to) in clusterNetLinks && (to linkedTo from) in clusterNetLinks )
+        (from in clientNodes || to in clientNodes) || ((from linkedTo to) in clusterNetLinks && (to linkedTo from) in clusterNetLinks) // todo sukhoa this is really discussible how we handle this for client nodes
 
 //    fun getAllAvailable(from: NodeAddress) = activeClusterNetLinks[from] ?: emptyList()
 }
