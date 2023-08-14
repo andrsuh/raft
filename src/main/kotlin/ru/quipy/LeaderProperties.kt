@@ -35,7 +35,7 @@ data class LeaderProperties(
     }
 
     fun getNextIndexToReplicate(follower: NodeAddress) =
-        followersInfo[follower] ?: throw IllegalArgumentException("No such follower $follower")
+        followersInfo[follower]?.nextIndexToReplicate ?: throw IllegalArgumentException("No such follower $follower")
 
     fun setTheCatchUpJob(follower: NodeAddress, catchUpJob: Deferred<Node.FollowerReplicationStatus>?) {
         val followerInfo = followersInfo[follower] ?: throw IllegalArgumentException("No such follower $follower")
