@@ -4,7 +4,7 @@ import ru.quipy.raft.NodeAddress
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
-val networkUpperTimeout = 20.milliseconds
+val networkUpperTimeout = 10.milliseconds
 
 class RaftProperties {
     companion object {

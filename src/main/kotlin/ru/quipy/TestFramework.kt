@@ -6,7 +6,6 @@ import kotlinx.coroutines.*
 import org.slf4j.LoggerFactory
 import ru.quipy.NodeRaftStatus.LEADER
 import ru.quipy.raft.*
-import java.util.*
 import java.util.concurrent.Executors
 import kotlin.random.Random.Default.nextInt
 import kotlin.time.Duration
@@ -27,16 +26,16 @@ var server = HTTPServer.Builder()
     .withPort(1234)
     .build()
 
-class TestSetup(
-    val numberOfRaftNodes: Int = 5,
+data class TestSetup(
+    val numberOfRaftNodes: Int = 7,
     val numberOfClientNodes: Int = 1,
-    val numberOfWrites: Int = 15,
+    val numberOfWrites: Int = 50,
     val writesTimeout: Duration = 2.seconds,
     val timeoutForDeadlockDetection: Duration = writesTimeout.plus(300.milliseconds),
     val networkChangingHooks: List<NetworkChangerHook> = listOf(
         randomNodePartitionOrOpposite,
-        randomNodePartitionOrOpposite,
         leaderPartitioning,
+        randomNodePartitionOrOpposite,
     )
 )
 
@@ -53,7 +52,7 @@ data class TestReport(
     val expectedStateMachine: Map<String, Int>,
 ) {
     override fun toString(): String {
-        return "TestReport(\nsuccess=$succcess,\nresultedLog=${resultedLog.map { "$it" }}),\nitems=${items.map { "\n$it" }}),\nstatesSnapshot=${statesSnapshot.map { "\n$it" }}),\n expected state machine $expectedStateMachine"
+        return "TestReport(\nsuccess=$succcess,\nsuccessfully sent: ${resultedLog.length}\nresultedLog=${resultedLog.map { "$it" }}),\nitems=${items.map { "\n$it" }}),\nstatesSnapshot=${statesSnapshot.map { "\n$it" }}),\n expected state machine $expectedStateMachine"
     }
 }
 
@@ -76,7 +75,7 @@ fun test(setUp: TestSetup): TestReport {
     val testItems = mutableListOf<TestReportItem<*>>()
     val snapshots = mutableListOf<String>()
 
-    val clientNode = NodeAddress(100500) // todo sukhoa use numberOfClientNodes
+    val clientNode = DatabaseClient.getLocalAddress()
 
     val clusterNodesAddresses = (1..(setUp.numberOfRaftNodes)).map { NodeAddress(it) }
 
@@ -91,19 +90,19 @@ fun test(setUp: TestSetup): TestReport {
         Node(it, clusterInformation, network, executor)
     }.toList()
 
-    val stateMachine = mutableMapOf<String, Int>()
+    val databaseClient = DatabaseClient(clientNode, clusterNodesAddresses, network, setUp.writesTimeout)
 
     var prevHash = 0;
     val logViewJob = PeriodicalJob(
         "client",
         "log-view",
         executor,
-        delayer = Delayer.InvocationRatePreservingDelay(500.milliseconds)
+        delayer = Delayer.InvocationRatePreservingDelay(1000.milliseconds)
     ) { _, _ ->
         val resultString = nodes.snapshot().toString()
         val newHash = resultString.hashCode()
         if (newHash != prevHash) {
-//            println(resultString)
+            //println(resultString)
             snapshots.add(resultString)
             prevHash = newHash
         }
@@ -116,38 +115,52 @@ fun test(setUp: TestSetup): TestReport {
         .zip(setUp.networkChangingHooks)
         .toMap() // todo sukhoa here the net change may be overwritten as the Randon can return same numbers
 
+    val rawStateMachine = mutableListOf<Triple<String, Int, Int>>()
+
     return runBlocking {
         var successfulResponses = 0
-        for (i in (1..setUp.numberOfWrites)) {
-            try {
-                withTimeout(setUp.timeoutForDeadlockDetection.inWholeMilliseconds) {
-                    val key = nextInt(0, 3).toString()
-                    val value = nextInt(0, 100)
-
-                    val dbCommand = ClientCommand(key = key, value = value)
-                    val response = network.requestAndWait<LogWriteClientRequest, LogWriteClientResponse>(
-                        clientNode,
-                        clusterNodesAddresses.random(),
-                        LogWriteClientRequest(dbCommand, cameFrom = clientNode, timeout = setUp.writesTimeout)
-                    )
-
-                    logger.info("Got response for write operation $response")
-                    testItems.add(TestReportItem(response, ", $dbCommand"))
-                    if (response.status == LogWriteStatus.SUCCESS) {
-                        stateMachine[key] = value
-                        requests.inc()
-                        successfulResponses++
-                    }
-                }
-            } catch (e: TimeoutCancellationException) {
-                logger.error("Deadlock detected during write operation. Setup $setUp")
-                testItems.add(TestReportItem(Unit, message = "Deadlock detected during write operation. Setup $setUp"))
-            }
-
-            networkChangeByOperationNumber[i]?.change(nodes, networkLinks)?.also {
-                testItems.add(it)
-            }
+        while (true) {
+            // here we just wait for cluster to choose the leader
+            val leader = nodes.find { it.termManager.getCurrentTerm().raftStatus == LEADER }
+            if (leader == null) delay(100) else break
         }
+
+        (1..setUp.numberOfWrites).map { i ->
+            async {
+                try {
+                    withTimeout(setUp.timeoutForDeadlockDetection.inWholeMilliseconds) {
+                        val key = nextInt(0, 3).toString()
+                        val value = nextInt(0, 100)
+
+                        val response = databaseClient.put(key, value)
+
+                        logger.info("Got response for write operation $response")
+                        testItems.add(TestReportItem(response, ", set key=$key, value=$value"))
+
+                        if (response.outcome == DbWriteOutcome.SUCCESS) {
+                            rawStateMachine.add(Triple(key, value, response.logIndex!!))
+                            successfulResponses++
+                        }
+                    }
+                } catch (e: TimeoutCancellationException) {
+                    logger.error("Deadlock detected during write operation. Setup $setUp")
+                    testItems.add(
+                        TestReportItem(
+                            Unit,
+                            message = "Deadlock detected during write operation. Setup $setUp"
+                        )
+                    )
+                }
+
+                networkChangeByOperationNumber[i]?.change(nodes, networkLinks)?.also {
+                    testItems.add(it)
+                }
+            }
+        }.joinAll()
+
+        delay(8_000) // let the cluster replicate the last values
+
+        val stateMachine = rawStateMachine.sortedBy { it.third }.associate { it.first to it.second }
 
         val resultedLogs = nodes
             .map { it.log.logAsTermsString(successfulResponses) }
@@ -175,7 +188,7 @@ fun test(setUp: TestSetup): TestReport {
                 expectedStateMachine = stateMachine
             )
         } else {
-            delay(5_000)
+            delay(3_000)
             return@runBlocking resultedLogs.firstNotNullOf {
                 if (it.key.length == successfulResponses) {
                     logger.info("Test successfully passed ${it.key}")
@@ -198,7 +211,6 @@ fun test(setUp: TestSetup): TestReport {
             }
         }
     }.also {
-//        snapshots.add(nodes.snapshot().toString())
         nodes.forEach { it.shutdown() }
         logViewJob.stop()
     }
@@ -284,20 +296,18 @@ val randomNodePartitionOrOpposite = NetworkChangerHook { nodes: List<Node>, link
     )
 }
 
-data class ClientCommand(
-    override val id: UUID = UUID.randomUUID(),
-    override val key: String,
-    override val value: Int
-) : Command
-
 fun List<Node>.snapshot(): StringBuilder {
     val sb = StringBuilder(500)
     forEach {
         val currentTerm = it.termManager.getCurrentTerm()
         sb.append(
-            "[Node ${it.me}], status: ${if (currentTerm.raftStatus == LEADER) "${currentTerm.raftStatus}  " else currentTerm.raftStatus}, term: ${currentTerm.number}, log: ${
-                it.log.log.map { "| ${it.termNumber}" }.joinToString { it }
-            } State machine ${it.stateMachine.map}"
+            "[Node ${it.me}], " +
+                    "status: ${if (currentTerm.raftStatus == LEADER) "${currentTerm.raftStatus}  " else currentTerm.raftStatus}, " +
+                    "term: ${currentTerm.termNumber}, " +
+                    "log: ${
+                        it.log.log.map { " ${it.termNumber}: (${it.command.key},${it.command.value})".padEnd(11, ' ') }
+                            .joinToString("| ") { it }
+                    } State machine ${it.stateMachine.map}"
         )
         sb.append("\n")
     }

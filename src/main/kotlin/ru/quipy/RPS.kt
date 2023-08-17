@@ -69,18 +69,20 @@ data class AppendEntriesRPCResponse(
  * RPSs below is out of the RAFT protocol scope
  */
 
-data class LogWriteClientRequest(
+data class DbWriteRequest(
     val command: Command,
     val cameFrom: NodeAddress,
     val timeout: Duration = 5.seconds,
 )
 
-data class LogWriteClientResponse(
-    val status: LogWriteStatus,
-    val passedThroughNodes: List<NodeAddress>
+data class DbWriteResponse(
+    val outcome: DbWriteOutcome,
+    val logIndex: Int? = null,
+    val passedThroughNodes: List<NodeAddress>,
+    val nodesUnreached: List<NodeAddress?> = emptyList()
 )
 
-enum class LogWriteStatus {
+enum class DbWriteOutcome {
     SUCCESS, FAIL
 }
 
