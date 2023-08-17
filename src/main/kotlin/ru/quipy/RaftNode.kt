@@ -32,8 +32,9 @@ class Node(
     private val dispatcher: CoroutineDispatcher = executor.asCoroutineDispatcher()
     private val scope = CoroutineScope(dispatcher)
 
+
     @Volatile
-    private var leaderProps = LeaderProperties(mutableMapOf())
+    private var leaderProps = LeaderProperties()
 
     @Volatile
     var termManager = TermManager()
@@ -45,10 +46,10 @@ class Node(
     private val replicationChannel = Channel<Int>(capacity = 100_000)
 
     @Volatile
-    private var lastKnownCommittedIndex = 0
+    private var lastHeartBeatFromMe: Long = 0
 
     @Volatile
-    private var lastHeartBeatFromMe: Long = 0
+    var currentlyReplicatingIndex = AtomicInteger(-1)
 
     fun shutdown() {
         electionJob.stop()
@@ -68,7 +69,7 @@ class Node(
         val currentTerm = termManager.getCurrentTerm()
         if (currentTerm.raftStatus != LEADER && acceptableHBAbsencePeriod.hasPassedSince(currentTerm.lastHeartbeatFromLeader)) {
             val (updateSucceeded, electionTerm) = termManager.startNewTermCAS(currentTerm) {
-                TermInfo(number = currentTerm.number + 1, votedFor = me, raftStatus = CANDIDATE)
+                TermInfo(termNumber = currentTerm.termNumber + 1, votedFor = me, raftStatus = CANDIDATE)
             }
 
             if (!updateSucceeded) {
@@ -94,23 +95,23 @@ class Node(
                     )
                     replicationChannel.send(indexToStartReplicationWith ?: 0)
 
-                    val updateSucceeded = termManager.tryUpdateWhileTermIs(electionTerm.number) {
+                    val updateSucceeded = termManager.tryUpdateWhileTermIs(electionTerm.termNumber) {
                         it.copy(raftStatus = LEADER)
                     }
                     if (updateSucceeded) {
-                        logger.info("[election]-[node-${me.address}]-[election-job]: Won the election node $me term ${electionTerm.number}. Voters: ${electionResult.votesForMe}")
+                        logger.info("[election]-[node-${me.address}]-[election-job]: Won the election node $me term ${electionTerm.termNumber}. Voters: ${electionResult.votesForMe}")
                     } else {
-                        logger.warn("[election]-[node-${me.address}]-[election-job]: Term has changed while won the election node $me term ${electionTerm.number}.")
+                        logger.warn("[election]-[node-${me.address}]-[election-job]: Term has changed while won the election node $me term ${electionTerm.termNumber}.")
                     }
                 }
                 is Failed -> {
-                    val updateSucceeded = termManager.tryUpdateWhileTermIs(electionTerm.number) {
+                    val updateSucceeded = termManager.tryUpdateWhileTermIs(electionTerm.termNumber) {
                         it.copy(raftStatus = FOLLOWER)
                     }
                     if (updateSucceeded) {
-                        logger.info("[election]-[node-${me.address}]-[election-job]: Failed election $me term ${electionTerm.number}")
+                        logger.info("[election]-[node-${me.address}]-[election-job]: Failed election $me term ${electionTerm.termNumber}")
                     } else {
-                        logger.info("[election]-[node-${me.address}]-[election-job]: Term changed while failed election $me term ${electionTerm.number}")
+                        logger.info("[election]-[node-${me.address}]-[election-job]: Term changed while failed election $me term ${electionTerm.termNumber}")
                     }
                 }
                 is HigherTermDetected -> {
@@ -119,24 +120,24 @@ class Node(
                      * If a candidate or leader discovers that its term is out of date, it immediately reverts to follower state.
                      */
                     logger.info("[election]-[node-${me.address}]-[election-job]: Failed election, higher term detected ${electionResult.termNumber} on node ${electionResult.nodeWithHigherTerm}. My term was ${electionResult.myTerm}")
-                    termManager.tryUpdateWhileConditionTrue({ it.number < electionResult.termNumber }) {
-                        TermInfo(number = electionResult.termNumber)
+                    termManager.tryUpdateWhileConditionTrue({ it.termNumber < electionResult.termNumber }) {
+                        TermInfo(termNumber = electionResult.termNumber)
                     }
                 }
                 is Timeout -> {
-                    logger.info("[election]-[node-${me.address}]-[election-job]: Election timeout $me term ${electionTerm.number}")
-                    termManager.tryUpdateWhileTermIs(electionTerm.number) {
+                    logger.info("[election]-[node-${me.address}]-[election-job]: Election timeout $me term ${electionTerm.termNumber}")
+                    termManager.tryUpdateWhileTermIs(electionTerm.termNumber) {
                         it.copy(raftStatus = FOLLOWER)
                     }
                 }
                 is RecognizedAnotherLeader -> {
                     logger.info("[election]-[node-${me.address}]-[election-job]: Recognised another leader for term ${electionResult.electionTerm}, leader ${electionResult.termInfo}")
-                    termManager.tryUpdateWhileTermIs(electionTerm.number) {
+                    termManager.tryUpdateWhileTermIs(electionTerm.termNumber) {
                         it.copy(raftStatus = FOLLOWER)
                     }
                 }
             }
-            termManager.tryUpdateWhileTermIs(electionTerm.number) {
+            termManager.tryUpdateWhileTermIs(electionTerm.termNumber) {
                 it.copy(lastHeartbeatFromLeader = System.currentTimeMillis())
             }
         }
@@ -160,34 +161,33 @@ class Node(
             is RequestVoteRPCRequest -> {
                 handleIncomingVoteRequest(netPacket.id, rpc)
             }
-            is LogWriteClientRequest -> {
+            is DbWriteRequest -> {
                 handleIncomingWriteRequest(netPacket.id, rpc)
             }
             else -> throw IllegalStateException("Unknown net packet type: $netPacket")
         }
     }
 
-    // todo sukhoa shoula be done inder lock for supporting concurrent clients
-    private fun handleIncomingWriteRequest(requestId: UUID, rpc: LogWriteClientRequest) = scope.launch {
+    private fun handleIncomingWriteRequest(requestId: UUID, rpc: DbWriteRequest) = scope.launch {
         logger.info("[write]-[node-${me.address}]-[client-write]: Got by node $me from ${rpc.cameFrom}, reqId $requestId")
         val startedAt = System.currentTimeMillis()
         var currentTerm = termManager.getCurrentTerm()
         try {
-            withTimeout(rpc.timeout.inWholeMilliseconds) { // todo sukhoa condifure and refactor
+            withTimeout(rpc.timeout.inWholeMilliseconds) { // todo sukhoa configure and refactor
                 while (currentTerm.leaderAddress == null) {
-                    delay(50)
+                    delay(30)
                     currentTerm = termManager.getCurrentTerm()
                 }
 
                 if (currentTerm.raftStatus != LEADER) {
                     // todo sukhoa what if CANDIDATE? leaderAddress is null
-                    val forward = LogWriteClientRequest(
+                    val forward = DbWriteRequest(
                         rpc.command,
                         cameFrom = me,
                         timeout = (rpc.timeout - (startedAt.durationUntilNow()))
                     )
 
-                    val response = network.requestAndWait<LogWriteClientRequest, LogWriteClientResponse>(
+                    val response = network.requestAndWait<DbWriteRequest, DbWriteResponse>(
                         from = me,
                         to = currentTerm.leaderAddress!!,
                         forward
@@ -201,7 +201,7 @@ class Node(
                     return@withTimeout
                 }
                 replicationAwaiter.placeKey(requestId)
-                val index = log.append(currentTerm.number, rpc.command, requestId)
+                val index = log.append(currentTerm.termNumber, rpc.command, requestId)
                 logger.info("[write]-[node-${me.address}]-[appended]: Leader append write to its log $index, reqId $requestId, rpc $rpc")
 
                 replicationChannel.send(index)
@@ -211,7 +211,7 @@ class Node(
                 network.respond(
                     me,
                     requestId,
-                    LogWriteClientResponse(LogWriteStatus.SUCCESS, passedThroughNodes = listOf(me))
+                    DbWriteResponse(DbWriteOutcome.SUCCESS, logIndex = index, passedThroughNodes = listOf(me))
                 )
             }
         } catch (e: TimeoutCancellationException) {
@@ -219,19 +219,16 @@ class Node(
             network.respond(
                 from = me,
                 requestId,
-                LogWriteClientResponse(status = LogWriteStatus.FAIL, listOf(me))
+                DbWriteResponse(outcome = DbWriteOutcome.FAIL, passedThroughNodes = listOf(me), nodesUnreached = listOf(currentTerm.leaderAddress))
             )
         }
     }
-
-    @Volatile
-    var currentlyReplicatingIndex = AtomicInteger(-1)
 
     private val replicationJob = PeriodicalJob(
         "raft",
         "replication",
         executor,
-        delayer = Delayer.InvocationRatePreservingDelay(1.milliseconds) // todo sukhoa config
+        delayer = Delayer.InvocationRatePreservingDelay(0.milliseconds) // todo sukhoa config
     ) { _, _ ->
         val currentTerm = termManager.getCurrentTerm()
         if (currentTerm.raftStatus != LEADER || log.isEmpty()) {
@@ -257,11 +254,8 @@ class Node(
 
         val replicationJobs = leaderProps.followersInfo.map { (node, info) ->
             if (info.catchUpJob != null && !info.catchUpJob.isCompleted) node to info.catchUpJob
-            else node to kickOffCatchUpJobAsync(
-                node,
-                indexToReplicate,
-                currentTerm
-            ).also { leaderProps.setTheCatchUpJob(node, it) }
+            else node to kickOffCatchingUpJobAsync(node, indexToReplicate, currentTerm)
+                .also { leaderProps.setTheCatchUpJob(node, it) }
         }.toMap(mutableMapOf())
 
         logger.info("[replication]-[node-${me.address}]-[replication-job]: Launched RPC calls for every cluster node to replicate log index $indexToReplicate, log entry $replicatedEntry")
@@ -275,28 +269,36 @@ class Node(
             when (replicationStatus) {
                 is Succeeded -> {
                     logger.info("[replication]-[node-${me.address}]-[replication-job]: Node ${replicationStatus.node} successful replication index $indexToReplicate, reqId ${replicatedEntry.requestId}")
-                    if (replicationStatus.lastReplicatedIndex == indexToReplicate) {
+                    if (replicationStatus.replicatedIndex == indexToReplicate) {
                         followersReplicated++
                         if (followersReplicated >= clusterInformation.majority) {
-                            log.commitIfRequired(indexToReplicate)
+                            val previouslyCommitted = log.commitIfRequired(indexToReplicate)
                             stateMachine.updateUpToLatest()
 
-                            logger.info("[replication]-[node-${me.address}]-[replication-job]: Log index $indexToReplicate was confirmed by the majority, reqId ${replicatedEntry.requestId}, replicated entry: $replicatedEntry")
-                            scope.launch {
-                                replicationAwaiter.putSecondValueAndWaitForFirst(
-                                    replicatedEntry.requestId,
-                                    Unit
-                                )
+                            if (previouslyCommitted != null && previouslyCommitted >= 0) { // we could replicate more than one entry during the job
+                                for (replicatedIndex in previouslyCommitted..indexToReplicate) {
+                                    val entry = log.logEntryOfIndex(replicatedIndex)
+                                        ?: error("[replication]-[node-${me.address}]-[replication-job]: There is no entry to replicate under index $replicatedIndex")
+
+                                    logger.info("[replication]-[node-${me.address}]-[replication-job]: Log index $replicatedIndex was confirmed by the majority, reqId ${entry.requestId}, replicated entry: $entry")
+                                    scope.launch {
+                                        replicationAwaiter.putSecondValueAndWaitForFirst(
+                                            entry.requestId,
+                                            Unit
+                                        )
+                                    }
+                                }
                             }
                             return@PeriodicalJob
                         }
                     } else {
                         logger.info(
-                            "[replication]-[node-${me.address}]-[replication-job]: Index ${replicationStatus.lastReplicatedIndex} " +
-                                    ", reqId ${replicatedEntry.requestId} replicated to follower ${replicationStatus.node}, but needed $indexToReplicate, kicked off catch up job"
+                            "[replication]-[node-${me.address}]-[replication-job]: Index ${replicationStatus.replicatedIndex} " +
+                                    ", reqId ${replicatedEntry.requestId} replicated to follower ${replicationStatus.node}, " +
+                                    "but needed $indexToReplicate, kicked off catch up job"
                         )
 
-                        kickOffCatchUpJobAsync(
+                        kickOffCatchingUpJobAsync(
                             replicationStatus.node,
                             indexToReplicate,
                             currentTerm
@@ -314,39 +316,41 @@ class Node(
         }
     }
 
-    private fun kickOffCatchUpJobAsync(
+    private fun kickOffCatchingUpJobAsync(
         follower: NodeAddress,
         indexToReplicate: Int,
-        currentTerm: TermInfo
+        currentTerm: TermInfo,
     ): Deferred<FollowerReplicationStatus> {
         return scope.async {
 
             logger.info("[replication]-[node-${me.address}]-[catch-up]: Kicked off catch up job for index $indexToReplicate for node $follower")
             val nextIndexToReplicate = leaderProps.getNextIndexToReplicate(follower)
+            if (nextIndexToReplicate > indexToReplicate) return@async Succeeded(follower, nextIndexToReplicate)
 
             val replicationResult = replicateValueToFollower(follower, nextIndexToReplicate, currentTerm)
-            if (replicationResult.followerTerm > termManager.getCurrentTerm().number) {
+
+            if (replicationResult.followerTerm > termManager.getCurrentTerm().termNumber) {
                 return@async FollowerReplicationStatus.Failed(follower, replicationResult.followerTerm)
             }
             if (replicationResult.success) {
-                if (indexToReplicate == currentlyReplicatingIndex.get()) {
+                if (nextIndexToReplicate == indexToReplicate) {
                     leaderProps.increaseFollowerReplicationIndex(follower)
                     return@async Succeeded(follower, indexToReplicate)
                 } else {
                     val nextIndex = leaderProps.increaseFollowerReplicationIndex(follower)
                     logger.info("[replication]-[node-${me.address}]-[catch-up]: Follower $follower replicate index $indexToReplicate, increasing index $nextIndex")
-                    return@async this@Node.kickOffCatchUpJobAsync(follower, nextIndex, currentTerm).await()
+                    return@async this@Node.kickOffCatchingUpJobAsync(follower, indexToReplicate, currentTerm).await()
                 }
             } else {
                 val nextIndex = leaderProps.decreaseFollowerReplicationIndex(follower)
                 logger.info("[replication]-[node-${me.address}]-[catch-up]: Follower $follower failed to replicate index $indexToReplicate, decreasing index $nextIndex")
-                return@async this@Node.kickOffCatchUpJobAsync(follower, nextIndex, currentTerm).await()
+                return@async this@Node.kickOffCatchingUpJobAsync(follower, indexToReplicate, currentTerm).await()
             }
         }
     }
 
     sealed class FollowerReplicationStatus(override val node: NodeAddress /* node == follower */) : NodeResponse {
-        class Succeeded(follower: NodeAddress, val lastReplicatedIndex: Int) : FollowerReplicationStatus(follower)
+        class Succeeded(follower: NodeAddress, val replicatedIndex: Int) : FollowerReplicationStatus(follower)
         class Failed(follower: NodeAddress, val termNumber: Int) : FollowerReplicationStatus(follower)
     }
 
@@ -358,13 +362,12 @@ class Node(
         // todo sukhoa if leader
         if (index < 0) error("[replication]-[node-${me.address}]-[replication-call]: Trying to replicate index $index")
 
-
         val currentEntry = log.logEntryOfIndex(index)
             ?: error("[replication]-[node-${me.address}]-[replication-call]: Trying to replicate index $index, but there is no in my log")
         val prevEntry = log.logEntryOfIndex(index - 1) ?: emptyLogEntity
 
         val appendEntriesRPCRequest = AppendEntriesRPCRequest(
-            currentTerm.number,
+            currentTerm.termNumber,
             me,
             prevEntry.termNumber,
             prevEntry.logIndex,
@@ -382,7 +385,7 @@ class Node(
 
     private fun handleIncomingHeartBeat(reqId: UUID, rpc: AppendEntriesRPCRequest) = scope.launch {
         val currentTerm = termManager.getCurrentTerm()
-        if (rpc.leaderTerm < currentTerm.number) {
+        if (rpc.leaderTerm < currentTerm.termNumber) {
             logger.info("[heartbeat]-[node-${me.address}]-[heartbeat-handle]: Rejected HB from ${rpc.leaderAddress} term ${rpc.leaderTerm} My term is higher")
             return@launch
 //            network.respond(me, reqId, AppendEntriesRPCResponse(term.number, success = false))
@@ -392,41 +395,41 @@ class Node(
         stateMachine.updateUpToLatest()
 
         // if leader term >= current and the election is in progress then we have to stop the election and recognise the new leader
-        if (termManager.tryUpdateWhileConditionTrue({ it.number == currentTerm.number && it.leaderAddress == null }) {
-                TermInfo(leaderAddress = rpc.leaderAddress, number = rpc.leaderTerm, raftStatus = FOLLOWER)
+        if (termManager.tryUpdateWhileConditionTrue({ it.termNumber == currentTerm.termNumber && it.leaderAddress == null }) {
+                TermInfo(leaderAddress = rpc.leaderAddress, termNumber = rpc.leaderTerm, raftStatus = FOLLOWER)
             }) {
             logger.info("[heartbeat]-[node-${me.address}]-[heartbeat-handle]: Term changed ${rpc}, previous ${termManager}. Leader Assigned")
             return@launch
         }
 
-        if (termManager.tryUpdateWhileConditionTrue({ rpc.leaderTerm > it.number }) {
-                TermInfo(leaderAddress = rpc.leaderAddress, number = rpc.leaderTerm, raftStatus = FOLLOWER)
+        if (termManager.tryUpdateWhileConditionTrue({ rpc.leaderTerm > it.termNumber }) {
+                TermInfo(leaderAddress = rpc.leaderAddress, termNumber = rpc.leaderTerm, raftStatus = FOLLOWER)
             }) {
             logger.info("[heartbeat]-[node-${me.address}]-[heartbeat-handle]: Term changed ${rpc}, previous ${termManager}. My term is lower")
             return@launch
         }
         logger.info("[heartbeat]-[node-${me.address}]-[heartbeat-handle]: Heartbeat from ${rpc.leaderAddress} term ${rpc.leaderTerm}")
 
-        termManager.tryUpdateWhileTermIs(currentTerm.number) {
+        termManager.tryUpdateWhileTermIs(currentTerm.termNumber) {
             it.copy(lastHeartbeatFromLeader = System.currentTimeMillis())
         }
     }
 
     private fun handleAppendRequest(reqId: UUID, rpc: AppendEntriesRPCRequest) = scope.launch {
         var currentTerm = termManager.getCurrentTerm()
-        if (rpc.leaderTerm < currentTerm.number) {
+        if (rpc.leaderTerm < currentTerm.termNumber) {
             logger.info("[replication]-[node-${me.address}]-[append]: Rejected append request from ${rpc.leaderAddress} term ${rpc.leaderTerm} My term is higher")
-            network.respond(me, reqId, AppendEntriesRPCResponse(currentTerm.number, success = false))
+            network.respond(me, reqId, AppendEntriesRPCResponse(currentTerm.termNumber, success = false))
         }
 
-        if (termManager.tryUpdateWhileConditionTrue({ it.number == currentTerm.number && it.leaderAddress == null }) {
-                TermInfo(leaderAddress = rpc.leaderAddress, number = rpc.leaderTerm, raftStatus = FOLLOWER)
+        if (termManager.tryUpdateWhileConditionTrue({ it.termNumber == currentTerm.termNumber && it.leaderAddress == null }) {
+                TermInfo(leaderAddress = rpc.leaderAddress, termNumber = rpc.leaderTerm, raftStatus = FOLLOWER)
             }) {
             logger.info("[heartbeat]-[node-${me.address}]-[append]: Term changed ${rpc}, previous ${termManager}. Leader Assigned")
         }
 
-        if (termManager.tryUpdateWhileConditionTrue({ rpc.leaderTerm > it.number }) {
-                TermInfo(leaderAddress = rpc.leaderAddress, number = rpc.leaderTerm, raftStatus = FOLLOWER)
+        if (termManager.tryUpdateWhileConditionTrue({ rpc.leaderTerm > it.termNumber }) {
+                TermInfo(leaderAddress = rpc.leaderAddress, termNumber = rpc.leaderTerm, raftStatus = FOLLOWER)
             }) {
             logger.info("[heartbeat]-[node-${me.address}]-[append]: Term changed ${rpc}, previous ${termManager}. My term is lower")
         }
@@ -434,7 +437,7 @@ class Node(
         currentTerm = termManager.getCurrentTerm() // todo sukhoa race condition
 
         if (!log.eligibleForReplication(rpc.logEntry!!.logIndex)) {
-            network.respond(me, reqId, AppendEntriesRPCResponse(currentTerm.number, success = false))
+            network.respond(me, reqId, AppendEntriesRPCResponse(currentTerm.termNumber, success = false))
             return@launch
         }
 
@@ -442,16 +445,16 @@ class Node(
         if (prevLogEntry.logIndex == rpc.prevEntryLogIndex && prevLogEntry.termNumber == rpc.prevEntryTerm) {
             log.acceptValueAndDeleteSubsequent(rpc.logEntry)
             logger.info("[replication]-[node-${me.address}]-[append]: Prev entries matches. Value $prevLogEntry. Accept replicating value ${rpc.logEntry}")
-            network.respond(me, reqId, AppendEntriesRPCResponse(currentTerm.number, success = true))
+            network.respond(me, reqId, AppendEntriesRPCResponse(currentTerm.termNumber, success = true))
 
             log.commitIfRequired(rpc.leaderHighestCommittedIndex)
             stateMachine.updateUpToLatest()
         } else {
             logger.info("[replication]-[node-${me.address}]-[append]: Prev entries doesnt match. My value $prevLogEntry. Leader ${rpc}}")
-            network.respond(me, reqId, AppendEntriesRPCResponse(currentTerm.number, success = false))
+            network.respond(me, reqId, AppendEntriesRPCResponse(currentTerm.termNumber, success = false))
         }
 
-        termManager.tryUpdateWhileTermIs(currentTerm.number) {
+        termManager.tryUpdateWhileTermIs(currentTerm.termNumber) {
             it.copy(lastHeartbeatFromLeader = System.currentTimeMillis())
         }
     }
@@ -467,7 +470,7 @@ class Node(
         if (currentTerm.raftStatus == LEADER && leaderHeartBeatFrequency.hasPassedSince(currentTerm.lastHeartbeatFromLeader)) {
 
             val appendEntriesRPCRequest = AppendEntriesRPCRequest(
-                currentTerm.number,
+                currentTerm.termNumber,
                 me,
                 leaderHighestCommittedIndex = log.lastCommittedIndex.get(),
             )
@@ -499,7 +502,7 @@ class Node(
 
         val myLastLogEntry = log.last() ?: emptyLogEntity
         val requestVoteRPCRequest = RequestVoteRPCRequest(
-            electionTerm.number,
+            electionTerm.termNumber,
             me,
             myLastLogEntry.logIndex,
             myLastLogEntry.termNumber
@@ -524,8 +527,8 @@ class Node(
             // then the candidate recognizes the leader as legitimate and returns to follower state. If the term in the
             // RPC is smaller than the candidate’s current term, then the candidate rejects the RPC and continues in candidate state.
             val latestTerm = termManager.getCurrentTerm()
-            if (latestTerm.number > electionTerm.number) {
-                return RecognizedAnotherLeader(electionTerm.number, latestTerm) // todo sukhoa should we cancel rpcs?
+            if (latestTerm.termNumber > electionTerm.termNumber) {
+                return RecognizedAnotherLeader(electionTerm.termNumber, latestTerm) // todo sukhoa should we cancel rpcs?
             }
 
             val voteResp = awaitingRPSs.awaitFirstAndRemoveFromCalls()
@@ -535,19 +538,19 @@ class Node(
                 voteResp.voteGranted -> {
                     votedForMe.add(voteResp.node)
                     if (votedForMe.size >= clusterInformation.majority) {
-                        termManager.tryUpdateWhileTermIs(electionTerm.number) {
+                        termManager.tryUpdateWhileTermIs(electionTerm.termNumber) {
                             TermInfo(
                                 me,
                                 lastHeartbeatFromLeader = System.currentTimeMillis(),
-                                number = electionTerm.number
+                                termNumber = electionTerm.termNumber
                             )
                         }
                         return Won(votedForMe, responded)
                     }
                 }
-                voteResp.currentTerm > electionTerm.number -> {
+                voteResp.currentTerm > electionTerm.termNumber -> {
                     logger.info("[election]-[node-${me.address}]-[rpc-request-vote-resp]: Term returned ${voteResp.currentTerm} is higher than mine $electionTerm")
-                    return HigherTermDetected(voteResp.currentTerm, voteResp.node, electionTerm.number)
+                    return HigherTermDetected(voteResp.currentTerm, voteResp.node, electionTerm.termNumber)
                 }
             }
         }
@@ -558,16 +561,16 @@ class Node(
         logger.info("[election]-[node-${me.address}]-[rpc-request-vote-req]: Got vote request $reqId $req")
 
         var currentTerm = termManager.getCurrentTerm()
-        if (req.candidatesTerm < currentTerm.number) {
-            val resp = RequestVoteRPCResponse(me, currentTerm.number, false)
+        if (req.candidatesTerm < currentTerm.termNumber) {
+            val resp = RequestVoteRPCResponse(me, currentTerm.termNumber, false)
             logger.info("[election]-[node-${me.address}]-[rpc-request-vote-req]: Vote against ${req.candidateId}, req $reqId, my term is higher")
             network.respond(me, reqId, resp)
         }
 
-        if (termManager.tryUpdateWhileConditionTrue({ req.candidatesTerm > it.number }) {
-                TermInfo(number = req.candidatesTerm)
+        if (termManager.tryUpdateWhileConditionTrue({ req.candidatesTerm > it.termNumber }) {
+                TermInfo(termNumber = req.candidatesTerm)
             }) {
-            logger.info("[election]-[node-${me.address}]-[rpc-request-vote-req]: Expired term ${currentTerm.number}, update to ${req.candidatesTerm}")
+            logger.info("[election]-[node-${me.address}]-[rpc-request-vote-req]: Expired term ${currentTerm.termNumber}, update to ${req.candidatesTerm}")
         }
         currentTerm = termManager.getCurrentTerm()
 
@@ -575,18 +578,18 @@ class Node(
         val candidatesLogEntry = req.toLogEntry(reqId)
 
 
-        if (termManager.tryUpdateWhileConditionTrue({ currentTerm.number == it.number && it.votedFor == null && myLastLogEntry <= candidatesLogEntry }) {
+        if (termManager.tryUpdateWhileConditionTrue({ currentTerm.termNumber == it.termNumber && it.votedFor == null && myLastLogEntry <= candidatesLogEntry }) {
                 it.copy(votedFor = req.candidateId)
             }) {
-            val resp = RequestVoteRPCResponse(me, currentTerm.number, true)
+            val resp = RequestVoteRPCResponse(me, currentTerm.termNumber, true)
             logger.info("[election]-[node-${me.address}]-[rpc-request-vote-req]: Vote for ${req.candidateId}, req $reqId")
             network.respond(me, reqId, resp)
 
         } else {
             currentTerm = termManager.getCurrentTerm()
-            val resp = RequestVoteRPCResponse(me, currentTerm.number, false)
+            val resp = RequestVoteRPCResponse(me, currentTerm.termNumber, false)
             val reason =
-                if (currentTerm.votedFor != null) "Already voted for ${currentTerm.votedFor} in term ${currentTerm.number}, candidate term ${req.candidatesTerm}" else "My log is more fresh"
+                if (currentTerm.votedFor != null) "Already voted for ${currentTerm.votedFor} in term ${currentTerm.termNumber}, candidate term ${req.candidatesTerm}" else "My log is more fresh"
             logger.info("[election]-[node-${me.address}]-[rpc-request-vote-req]: Vote against ${req.candidateId}, req $reqId. $reason")
             network.respond(me, reqId, resp)
         }

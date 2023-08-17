@@ -1,8 +1,8 @@
 package ru.quipy
 
+import ru.quipy.NodeRaftStatus.FOLLOWER
 import ru.quipy.TermInfo.Companion.initialTermInfo
 import ru.quipy.raft.NodeAddress
-import ru.quipy.NodeRaftStatus.FOLLOWER
 import java.util.concurrent.atomic.AtomicReference
 
 class TermManager {
@@ -14,7 +14,7 @@ class TermManager {
     fun tryUpdateWhileTermIs(termNumber: Int, transform: (current: TermInfo) -> TermInfo): Boolean {
         while (true) {
             val current = currentTerm.get()
-            if (current.number != termNumber) return false
+            if (current.termNumber != termNumber) return false
             val (success, _) = updateTermCAS(current, transform)
             if (success) return true
         }
@@ -32,11 +32,11 @@ class TermManager {
         }
     }
 
-    fun updateTermCAS(expected: TermInfo, transform: (current: TermInfo) -> TermInfo): Pair<Boolean, TermInfo> {
+    private fun updateTermCAS(expected: TermInfo, transform: (current: TermInfo) -> TermInfo): Pair<Boolean, TermInfo> {
         val current = currentTerm.get()
         val updated = transform(current)
 
-        if (current != expected) return false to updated // todo sukhoa weird a bit, returns something undefined value
+        if (current != expected) return false to updated // todo sukhoa weird a bit, returns some undefined value
         return (currentTerm.compareAndExchange(expected, updated) == expected) to updated
     }
 
@@ -44,7 +44,7 @@ class TermManager {
         val current = currentTerm.get()
         val updated = transform()
 
-        if (current != expected) return false to updated // todo sukhoa weird a bit, returns something undefined value
+        if (current != expected) return false to updated // todo sukhoa weird a bit, returns some undefined value
         return (currentTerm.compareAndExchange(expected, updated) == expected) to updated
     }
 }
@@ -65,8 +65,8 @@ data class TermInfo(
      * If a candidate or leader discovers that its term is out of date, it immediately reverts to follower state.
      * If a server receives a request with a stale term number, it rejects the request.
      */
-    val number: Int,
-    val votedFor: NodeAddress? = null, // todo sukhoa should be updated atomically with currentTerm
+    val termNumber: Int,
+    val votedFor: NodeAddress? = null,
 
     /**
      * See [RaftProperties.electionTimeoutBase]

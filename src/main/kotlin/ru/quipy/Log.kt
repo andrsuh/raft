@@ -33,6 +33,7 @@ class Log(private val node: NodeAddress) {
 
     private val logMutex = Mutex()
 
+    // todo sukhoa probably it's worth to track the current term and decline writes with smaller term
     suspend fun append(term: Int, command: Command, requestId: UUID): Int {
         logMutex.withLock {
             lastIndex++
@@ -41,26 +42,26 @@ class Log(private val node: NodeAddress) {
         }
     }
 
-    fun last() = log.lastOrNull() // todo sukhoa sync and others too
+    fun last() = log.lastOrNull()
 
-//    fun lastCommittedIndex(): Int = lastCommittedIndex
+    fun lastCommittedIndex(): Int = lastCommittedIndex.get()
 
-    suspend fun commitIfRequired(indexToCommit: Int) {
+    suspend fun commitIfRequired(indexToCommit: Int): Int? {
         logMutex.withLock {
             while (true) {
                 if (lastIndex < indexToCommit || log.isEmpty()) {
                     logger.info("[log]-[node-${node.address}]-[commit-if-required]: Didn't committed $indexToCommit Log size ${log.size}, last index $lastIndex")
-                    break
+                    return null
                 }
                 val myLastCommitted = lastCommittedIndex.get()
                 if (myLastCommitted < indexToCommit) {
                     if (lastCommittedIndex.compareAndSet(myLastCommitted, indexToCommit))  {
                         logger.info("[log]-[node-${node.address}]-[commit-if-required]: Committed index $indexToCommit")
-                        break
+                        return myLastCommitted
                     }
                 } else {
                     logger.info("[log]-[node-${node.address}]-[commit-if-required]: Didn't committed $indexToCommit, as mine committed $myLastCommitted")
-                    break
+                    return null
                 }
             }
         }
@@ -71,12 +72,14 @@ class Log(private val node: NodeAddress) {
         return log[index]
     }
 
-    fun acceptValueAndDeleteSubsequent(replicating: LogEntry) {
-        log.removeIf {
-            it.logIndex >= replicating.logIndex
+    suspend fun acceptValueAndDeleteSubsequent(replicating: LogEntry) {
+        logMutex.withLock {
+            log.removeIf {
+                it.logIndex >= replicating.logIndex
+            }
+            log.add(replicating)
+            lastIndex = replicating.logIndex
         }
-        log.add(replicating)
-        lastIndex = replicating.logIndex
     }
 
     fun logAsTermsString(fistNElements: Int) =

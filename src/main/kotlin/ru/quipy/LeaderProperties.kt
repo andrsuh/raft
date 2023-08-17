@@ -17,7 +17,7 @@ data class LeaderProperties(
      * entries from the leader’s log (if any). Once AppendEntries succeeds, the follower’s log is consistent with the
      * leader’s, and it will remain that way for the rest of the term.
      */
-    val followersInfo: MutableMap<NodeAddress, FollowerInfo>,
+    val followersInfo: MutableMap<NodeAddress, FollowerInfo> = mutableMapOf(),
 ) {
     fun decreaseFollowerReplicationIndex(follower: NodeAddress): Int {
         val followerInfo = followersInfo[follower] ?: throw IllegalArgumentException("No such follower $follower")
