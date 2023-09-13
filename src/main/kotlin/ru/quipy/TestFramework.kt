@@ -8,6 +8,7 @@ import ru.quipy.NodeRaftStatus.LEADER
 import ru.quipy.raft.*
 import java.util.concurrent.Executors
 import kotlin.random.Random.Default.nextInt
+import kotlin.random.Random.Default.nextLong
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -27,15 +28,19 @@ var server = HTTPServer.Builder()
     .build()
 
 data class TestSetup(
-    val numberOfRaftNodes: Int = 7,
+    val numberOfRaftNodes: Int = 5,
     val numberOfClientNodes: Int = 1,
-    val numberOfWrites: Int = 50,
+    val numberOfWrites: Int = 100,
     val writesTimeout: Duration = 2.seconds,
     val timeoutForDeadlockDetection: Duration = writesTimeout.plus(300.milliseconds),
     val networkChangingHooks: List<NetworkChangerHook> = listOf(
-        randomNodePartitionOrOpposite,
+        randomNodePartitioning,
+        nodeResurrection,
         leaderPartitioning,
         randomNodePartitionOrOpposite,
+        nodeResurrection,
+        randomNodePartitionOrOpposite,
+        nodeResurrection,
     )
 )
 
@@ -128,6 +133,7 @@ fun test(setUp: TestSetup): TestReport {
         (1..setUp.numberOfWrites).map { i ->
             async {
                 try {
+                    delay(nextLong((networkUpperTimeout.inWholeMilliseconds * 2 + networkUpperTimeout.inWholeMilliseconds) * setUp.numberOfWrites + 5 * RaftProperties.electionTimeoutBase.inWholeMilliseconds))
                     withTimeout(setUp.timeoutForDeadlockDetection.inWholeMilliseconds) {
                         val key = nextInt(0, 3).toString()
                         val value = nextInt(0, 100)
@@ -188,7 +194,6 @@ fun test(setUp: TestSetup): TestReport {
                 expectedStateMachine = stateMachine
             )
         } else {
-            delay(3_000)
             return@runBlocking resultedLogs.firstNotNullOf {
                 if (it.key.length == successfulResponses) {
                     logger.info("Test successfully passed ${it.key}")
@@ -267,6 +272,29 @@ val randomNodePartitioning = NetworkChangerHook { nodes: List<Node>, links: Set<
     return@NetworkChangerHook TestReportItem(
         NetworkChangeResult(linksChanged),
         message = "Node ${nodeToPartition.me} was partitioned"
+    )
+}
+
+val nodeResurrection = NetworkChangerHook { nodes: List<Node>, links: Set<NetworkLink> ->
+    val nodeToResurrect = nodes.filter { node ->
+        links.filter { link -> link sourceOrDestinationIs node.me }
+            .any { link -> (link sourceIs node.me && !link.fromActive) || (link destinationIs node.me && !link.toActive) }
+    }.firstOrNull() ?: return@NetworkChangerHook TestReportItem(NetworkChangeResult(emptyList()), "Nothing was resurrected")
+
+    logger.info("Resurrecting node ${nodeToResurrect.me}")
+    val linksChanged = mutableListOf<NetworkLink>()
+    links.filter { link -> link sourceOrDestinationIs nodeToResurrect.me }
+        .forEach { link ->
+            when {
+                link sourceIs nodeToResurrect.me -> link.fromActive = true
+                link destinationIs nodeToResurrect.me -> link.toActive = true
+            }
+            linksChanged.add(link.copy())
+        }
+
+    return@NetworkChangerHook TestReportItem(
+        NetworkChangeResult(linksChanged),
+        message = "Node ${nodeToResurrect.me} was resurrected"
     )
 }
 
